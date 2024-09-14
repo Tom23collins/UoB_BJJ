@@ -1,16 +1,17 @@
 import mysql.connector
+import config
 
-def connection_open(app):
+def connection_open():
     return mysql.connector.connect(
-        host=app.config.get('DB_HOST'),
-        user=app.config.get('DB_USER'),
-        password=app.config.get('DB_PASSWORD'),
-        database=app.config.get('DB_NAME')
+        host=config.DB_HOST,
+        user=config.DB_USER,
+        password=config.DB_PASSWORD,
+        database=config.DB_NAME
     )
 
-def db_update(app, sql, values):
+def db_update(sql, values):
     try:
-        connection = connection_open(app)
+        connection = connection_open()
         cursor = connection.cursor()
         cursor.execute(sql, values)
         connection.commit()
@@ -24,14 +25,38 @@ def db_update(app, sql, values):
         if connection:
             connection.close()
 
-def db_query(app, sql):
-    connection = connection_open(app)
-    cursor = connection.cursor()
-    cursor.execute(sql)
-    return cursor.fetchall()
+def db_query(sql):
+    try:
+        connection = connection_open()
+        cursor = connection.cursor()
+        cursor.execute(sql)
+        result = cursor.fetchall()
+        return result
 
-def db_query_values(app, sql, values):
-    connection = connection_open(app)
-    cursor = connection.cursor()
-    cursor.execute(sql, values)
-    return cursor.fetchall()
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        return None
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+def db_query_values(sql, values):
+    try:
+        connection = connection_open()
+        cursor = connection.cursor()
+        cursor.execute(sql, values)
+        result = cursor.fetchall()
+        return result
+
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        return None
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()

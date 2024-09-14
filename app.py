@@ -1,100 +1,101 @@
-from flask import Flask, redirect, render_template, url_for, request, flash
-import flask_login
+from fastapi import FastAPI, Request, Depends, HTTPException, status, Form
+from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi_login import LoginManager
+from datetime import datetime
+from functools import wraps
+import os
+from werkzeug.security import generate_password_hash, check_password_hash
 from db import db_query, db_update, db_query_values
 import config
-import os
-from datetime import datetime
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
 from scripts import format_date, send_welcome_email
-from flask_mail import Mail, Message
 
-app = Flask(__name__)
-app.config.from_object(config)
-app.secret_key = app.config.get('SECRET_KEY')
-app.config['MAIL_SERVER'] = app.config.get('MAIL_SERVER')
-app.config['MAIL_PORT'] = app.config.get('MAIL_PORT')
-app.config['MAIL_USE_SSL'] = app.config.get('MAIL_USE_SSL')
-app.config['MAIL_USERNAME'] = app.config.get('MAIL_USERNAME')
-app.config['MAIL_PASSWORD'] = app.config.get('MAIL_KEY')
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=config.SECRET_KEY)
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-mail = Mail(app) 
+# Initialize LoginManager
+SECRET = config.SECRET_KEY
+manager = LoginManager(SECRET, token_url='/login', use_cookie=True)
+manager.cookie_name = 'auth_token'
 
+# Mail configurations
+app.state.MAIL_SERVER = config.MAIL_SERVER
+app.state.MAIL_PORT = config.MAIL_PORT
+app.state.MAIL_USE_SSL = config.MAIL_USE_SSL
+app.state.MAIL_USERNAME = config.MAIL_USERNAME
+app.state.MAIL_PASSWORD = config.MAIL_KEY
+
+# If in development, set debug mode
 if os.getenv('FLASK_ENV') == 'development':
-    app.config['DEBUG'] = True
+    app.debug = True
 
-class User(flask_login.UserMixin):
-    pass
+# User model
+class User:
+    def __init__(self, id, password, first_name, last_name, medical_info, user_role):
+        self.id = id
+        self.password = password
+        self.first_name = first_name
+        self.last_name = last_name
+        self.medical_info = medical_info
+        self.user_role = user_role
 
-login_manager = flask_login.LoginManager()
-login_manager.init_app(app)
-
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
-def role_required(role):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            if not flask_login.current_user.is_authenticated:
-                flash("You need to be logged in to access this page.")
-                return redirect(url_for('login'))
-            
-            # Bypass if user role is admin
-            if flask_login.current_user.user_role == 'administrator':
-                return f(*args, **kwargs)
-
-            # Check if the user has the required role
-            if flask_login.current_user.user_role != role:
-                flash("You don't have the required role to access this page.")
-                return redirect(url_for('index'))
-
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-
-@login_manager.user_loader
-def user_loader(email):
-    user_data = db_query_values(app, 'SELECT * FROM user_table WHERE email = %s', (email,))
+@manager.user_loader()
+def load_user(email: str):
+    user_data = db_query_values('SELECT * FROM user_table WHERE email = %s', (email,))
     if not user_data:
         return None
-
-    user = User()
-    user.id = user_data[0][0]
-    user.password = user_data[0][1]
-    user.first_name = user_data[0][2]
-    user.last_name = user_data[0][3]
-    user.medical_info = user_data[0][4]
-    user.user_role = user_data[0][5]
+    user = User(
+        id=user_data[0][0],
+        password=user_data[0][1],
+        first_name=user_data[0][2],
+        last_name=user_data[0][3],
+        medical_info=user_data[0][4],
+        user_role=user_data[0][5]
+    )
     return user
 
-@app.route('/')
-def index():
+def role_required(role: str):
+    async def role_checker(user: User = Depends(manager)):
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='You need to be logged in to access this page.')
+        if user.user_role == 'administrator':
+            return user
+        if user.user_role != role:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have the required role to access this page.")
+        return user
+    return Depends(role_checker)
+
+@app.get('/', response_class=HTMLResponse)
+async def index(request: Request):
+    user = None
+    try:
+        user = manager.get_current_user()
+    except:
+        pass
+
     current_date = datetime.now().strftime('%Y-%m-%d')
-    session_data = db_query_values(app, 'SELECT * FROM event_table WHERE date >= %s', (current_date,))
+    session_data = db_query_values('SELECT * FROM event_table WHERE date >= %s', (current_date,))
     
     updated_sessions = []
     registration_event_ids = set()
     user_registrations = {}
 
-    if flask_login.current_user.is_authenticated:
-        registrations = db_query_values(app, 'SELECT event_id, booked_gi FROM sign_up_log WHERE email = %s', (flask_login.current_user.id,))
+    if user:
+        registrations = db_query_values('SELECT event_id, booked_gi FROM sign_up_log WHERE email = %s', (user.id,))
         registration_event_ids = {int(registration[0]) for registration in registrations}
         user_registrations = {int(registration[0]): registration[1] for registration in registrations}
 
     session_ids = tuple(session[0] for session in session_data)
-    
+
     if session_ids:
-        # Create a placeholder string for the number of session_ids
         placeholders = ', '.join(['%s'] * len(session_ids))
-        
-        # Fetch registration counts for all events
-        registration_counts = db_query_values(app, f'SELECT event_id, COUNT(*) FROM sign_up_log WHERE event_id IN ({placeholders}) GROUP BY event_id', session_ids)
+        registration_counts = db_query_values(f'SELECT event_id, COUNT(*) FROM sign_up_log WHERE event_id IN ({placeholders}) GROUP BY event_id', session_ids)
         registration_count_dict = {int(row[0]): row[1] for row in registration_counts}
-        
-        # Fetch gis_booked counts for all events
-        gis_booked_counts = db_query_values(app, f'SELECT event_id, COUNT(*) FROM sign_up_log WHERE event_id IN ({placeholders}) AND booked_gi = 1 GROUP BY event_id', session_ids)
+        gis_booked_counts = db_query_values(f'SELECT event_id, COUNT(*) FROM sign_up_log WHERE event_id IN ({placeholders}) AND booked_gi = 1 GROUP BY event_id', session_ids)
         gis_booked_dict = {int(row[0]): row[1] for row in gis_booked_counts}
     else:
         registration_count_dict = {}
@@ -102,7 +103,7 @@ def index():
 
     for session in session_data:
         event_id = int(session[0])
-        registered = event_id in registration_event_ids if flask_login.current_user.is_authenticated else False
+        registered = event_id in registration_event_ids if user else False
         booked_gi = bool(user_registrations.get(event_id, False)) if registered else False
 
         event = {
@@ -122,133 +123,113 @@ def index():
             'event_topic': session[9],
             'event_coach': session[10],
         }
-        
+
         updated_sessions.append(event)
 
-    return render_template('index.html', 
-                           event_data=updated_sessions,
-                           user=flask_login.current_user)
+    return templates.TemplateResponse('index.html', {"request": request, "event_data": updated_sessions, "user": user})
 
-@app.route('/about')
-def about():
-    return render_template('about.html',
-                    user=flask_login.current_user)
+@app.get('/about', response_class=HTMLResponse)
+async def about(request: Request):
+    user = None
+    try:
+        user = manager.get_current_user()
+    except:
+        pass
+    return templates.TemplateResponse('about.html', {'request': request, 'user': user})
 
-@app.route('/class-sign-up', methods=['GET'])
-@flask_login.login_required
-def class_sign_up():
-    if request.method == 'GET':
-        sql = """
-        INSERT INTO sign_up_log (`email`, `event_id`, `timestamp`) 
-        VALUES (%s, %s, %s)
-        """
-        values = (flask_login.current_user.id,
-                  request.args.get('event_id'),
-                  datetime.now())
-        db_update(app, sql, values)
-    return redirect(url_for('index'))
+@app.get('/class-sign-up')
+async def class_sign_up(event_id: int, user: User = Depends(manager)):
+    sql = """
+    INSERT INTO sign_up_log (`email`, `event_id`, `timestamp`) 
+    VALUES (%s, %s, %s)
+    """
+    values = (user.id, event_id, datetime.now())
+    db_update(sql, values)
+    return RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
 
-@app.route('/cancel-sign-up', methods=['GET'])
-@flask_login.login_required
-def cancel_sign_up():
-    if request.method == 'GET':
-        sql = """
-            DELETE FROM sign_up_log
-            WHERE email = %s 
-            AND event_id = %s
-        """
-        values = (flask_login.current_user.id,
-                request.args.get('event_id'))
-        db_update(app, sql, values)
-    return redirect(url_for('index'))
+@app.get('/cancel-sign-up')
+async def cancel_sign_up(event_id: int, user: User = Depends(manager)):
+    sql = """
+        DELETE FROM sign_up_log
+        WHERE email = %s 
+        AND event_id = %s
+    """
+    values = (user.id, event_id)
+    db_update(sql, values)
+    return RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'GET':
-        return render_template('user_register.html')
+@app.get('/register', response_class=HTMLResponse)
+async def register_get(request: Request):
+    return templates.TemplateResponse('user_register.html', {'request': request})
 
-    # Prepare SQL query to insert new user
+@app.post('/register')
+async def register_post(email: str = Form(...), password: str = Form(...), first_name: str = Form(...), last_name: str = Form(...), medical_info: str = Form(...)):
     sql = """
     INSERT INTO user_table (`email`, `password`, `first_name`, `last_name`, `medical_info`)
     VALUES (%s, %s, %s, %s, %s)
     """
     values = (
-        request.form['email'],
-        generate_password_hash(request.form['password']),
-        request.form['first_name'],
-        request.form['last_name'],
-        request.form['medical_info']
+        email,
+        generate_password_hash(password),
+        first_name,
+        last_name,
+        medical_info
     )
+    db_update(sql, values)
 
-    # Execute the database update function
-    db_update(app, sql, values)
+    send_welcome_email(email, first_name)
 
-    send_welcome_email(app, mail, request.form['email'], request.form['first_name'])
+    return RedirectResponse(url='/login', status_code=status.HTTP_302_FOUND)
 
-    # Redirect to the login page after successful registration
-    return redirect(url_for('login'))
+@app.get('/login', response_class=HTMLResponse)
+async def login_get(request: Request):
+    return templates.TemplateResponse('user_login.html', {'request': request})
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'GET':
-        return render_template('user_login.html')
-
-    # Extract email and password from the form submission
-    email = request.form['email']
-    password = request.form['password']
-
-    # Load the user using the email
-    user = user_loader(email)
+@app.post('/login')
+async def login_post(request: Request, email: str = Form(...), password: str = Form(...)):
+    user = load_user(email)
     if user and check_password_hash(user.password, password):
-        flask_login.login_user(user)
-        return redirect(url_for('index'))
+        access_token = manager.create_access_token(
+            data={'sub': email}
+        )
+        response = RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
+        manager.set_cookie(response, access_token)
+        return response
 
-    # If login fails, return an error
-    error = "Invalid email or password. Please contact a comittee member if you have forgotten your login."
-    return render_template('user_login.html', error=error)
+    error = "Invalid email or password. Please contact a committee member if you have forgotten your login."
+    return templates.TemplateResponse('user_login.html', {'request': request, 'error': error})
 
-@app.route('/book-taster-gi', methods=['GET'])
-@flask_login.login_required
-def book_taster_gi():
-    if request.method == 'GET':
-        sql = """
-        UPDATE sign_up_log
-        SET booked_gi = 1
-        WHERE email = %s AND event_id = %s;
-        """
-        values = (flask_login.current_user.id,
-                  request.args.get('event_id'))
-        db_update(app, sql, values)
-    return redirect(url_for('index'))
+@app.get('/book-taster-gi')
+async def book_taster_gi(event_id: int, user: User = Depends(manager)):
+    sql = """
+    UPDATE sign_up_log
+    SET booked_gi = 1
+    WHERE email = %s AND event_id = %s;
+    """
+    values = (user.id, event_id)
+    db_update(sql, values)
+    return RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
 
-@app.route('/logout')
+@app.get('/logout')
 def logout():
-    flask_login.logout_user()
-    return redirect(url_for('index'))
-
-@login_manager.unauthorized_handler
-def unauthorized_handler():
-    return redirect(url_for('register'))
-
+    response = RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
+    response.delete_cookie(manager.cookie_name)
+    return response
 
 # Committee views
-@app.route('/sign-ups', methods=['GET'])
-@role_required('committee')
-@flask_login.login_required
-def view_sign_ups():
+@app.get('/sign-ups', response_class=HTMLResponse)
+async def view_sign_ups(request: Request, event_id: int, user: User = role_required('committee')):
     sign_up_data = []
-    event_id = (request.args.get('event_id'),)
     sql = "SELECT * FROM sign_up_log WHERE event_id = %s"
-    for sign_ups in db_query_values(app, sql, event_id):
-        names = db_query_values(app, "SELECT first_name, last_name FROM user_table WHERE email = %s", (sign_ups[1],))
-        print(bool(sign_ups[4]))
+    for sign_ups in db_query_values(sql, (event_id,)):
+        names = db_query_values("SELECT first_name, last_name FROM user_table WHERE email = %s", (sign_ups[1],))
         sign_up = {
             'first_name': names[0][0],
-            'last_name': names[0][1],  # Convert event_id to integer
+            'last_name': names[0][1],
             'booked_gi': bool(sign_ups[4])
         }
         sign_up_data.append(sign_up)
-    data = db_query_values(app, 'SELECT * FROM event_table WHERE event_id = %s', event_id)
+    data = db_query_values('SELECT * FROM event_table WHERE event_id = %s', (event_id,))
     event = {
         'event_id': data[0][0],
         'event_name': data[0][1],
@@ -259,151 +240,117 @@ def view_sign_ups():
         'capacity': data[0][6],
         'location': data[0][7]
     }
-    
-    return render_template('/committee/sign_ups.html',
-                           user=flask_login.current_user,
-                           event_data=event,
-                           data=sign_up_data)
+    return templates.TemplateResponse('/committee/sign_ups.html', {'request': request, 'user': user, 'event_data': event, 'data': sign_up_data})
 
+@app.get('/new-event', response_class=HTMLResponse)
+async def create_new_event_get(request: Request, user: User = role_required('committee')):
+    return templates.TemplateResponse('/committee/create_new_event.html', {'request': request, 'user': user})
 
-@app.route('/new-event', methods=['GET', 'POST'])
-@role_required('committee')
-def create_new_event():
-    if request.method == 'GET':
-        return render_template('/committee/create_new_event.html',
-                               user=flask_login.current_user)
-    
+@app.post('/new-event')
+async def create_new_event_post(event_name: str = Form(...), date: str = Form(...), start_time: str = Form(...), end_time: str = Form(...), category: str = Form(...), capacity: int = Form(...), location: str = Form(...), location_link: str = Form(None), event_topic: str = Form(None), event_coach: str = Form(None), user: User = role_required('committee')):
     sql = """
     INSERT INTO event_table (`event_name`, `date`, `start_time`, `end_time`, `category`, `capacity`, `location`, `location_link`, `event_topic`, `event_coach`)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     values = (
-        request.form['event_name'],
-        request.form['date'],
-        request.form.get('start_time'),
-        request.form.get('end_time'),
-        request.form.get('category'),
-        request.form.get('capacity'),
-        request.form.get('location'),
-        request.form.get('location_link'),
-        request.form.get('event_topic'),
-        request.form.get('event_coach')
+        event_name,
+        date,
+        start_time,
+        end_time,
+        category,
+        capacity,
+        location,
+        location_link,
+        event_topic,
+        event_coach
     )
-    db_update(app, sql, values)
+    db_update(sql, values)
+    return RedirectResponse(url='/new-event', status_code=status.HTTP_302_FOUND)
 
-    return render_template('/committee/create_new_event.html',
-                           user=flask_login.current_user)
+@app.get('/edit-event', response_class=HTMLResponse)
+async def edit_event_get(request: Request, event_id: int, user: User = role_required('committee')):
+    data = db_query_values('SELECT * FROM event_table WHERE event_id = %s', (event_id,))
+    event = {
+        'event_id': data[0][0],
+        'event_name': data[0][1],
+        'date': data[0][2].strftime("%Y-%m-%d"),
+        'start_time': datetime.strptime(str(data[0][3]), "%H:%M:%S").strftime("%H:%M"),
+        'end_time': datetime.strptime(str(data[0][4]), "%H:%M:%S").strftime("%H:%M"),
+        'category': data[0][5],
+        'capacity': data[0][6],
+        'location': data[0][7],
+        'location_link': data[0][8],
+        'event_topic': data[0][9],
+        'event_coach': data[0][10]
+    }
+    return templates.TemplateResponse('/committee/edit_event.html', {'request': request, 'user': user, 'data': event})
 
+@app.post('/edit-event')
+async def edit_event_post(event_id: int = Form(...), event_name: str = Form(...), date: str = Form(...), start_time: str = Form(...), end_time: str = Form(...), category: str = Form(...), capacity: int = Form(...), location: str = Form(...), location_link: str = Form(None), event_topic: str = Form(None), event_coach: str = Form(None), user: User = role_required('committee')):
+    sql = """
+    UPDATE event_table
+    SET event_name = %s, date = %s, start_time = %s, end_time = %s, category = %s, 
+        capacity = %s, location = %s, location_link = %s, event_topic=%s, event_coach=%s
+    WHERE event_id = %s
+    """
+    values = (
+        event_name,
+        date,
+        start_time,
+        end_time,
+        category,
+        capacity,
+        location,
+        location_link,
+        event_topic,
+        event_coach,
+        event_id,
+    )
+    db_update(sql, values)
+    return RedirectResponse(url='/', status_code=status.HTTP_302_FOUND)
 
-@app.route('/edit-event', methods=['GET', 'POST'])
-@role_required('committee')
-@flask_login.login_required
-def edit_event():
-    if request.method == 'GET':
-        event_id = (request.args.get('event_id'),)
-        data = db_query_values(app, 'SELECT * FROM event_table WHERE event_id = %s', event_id)
-        event = {
-            'event_id': data[0][0],
-            'event_name': data[0][1],
-            'date': data[0][2].strftime("%Y-%m-%d"),
-            'start_time': datetime.strptime(str(data[0][3]), "%H:%M:%S").strftime("%H:%M"),
-            'end_time': datetime.strptime(str(data[0][4]), "%H:%M:%S").strftime("%H:%M"),
-            'category': data[0][5],
-            'capacity': data[0][6],
-            'location': data[0][7],
-            'location_link': data[0][8],
-            'event_topic': data[0][9],
-            'event_coach': data[0][10]
-        }
-        return render_template('/committee/edit_event.html', user=flask_login.current_user, data=event)
-    
-    if request.method == 'POST':
-        # SQL Update Statement
-        sql = """
-        UPDATE event_table
-        SET event_name = %s, date = %s, start_time = %s, end_time = %s, category = %s, 
-            capacity = %s, location = %s, location_link = %s, event_topic=%s, event_coach=%s
-        WHERE event_id = %s
-        """
-        
-        # Extract form data
-        values = (
-            request.form['event_name'],
-            request.form['date'],
-            request.form['start_time'],
-            request.form['end_time'],
-            request.form['category'],
-            request.form['capacity'],
-            request.form['location'],
-            request.form['location_link'],
-            request.form['event_topic'],
-            request.form['event_coach'],
-            request.form['event_id'],
-        )
-        # Update the database
-        db_update(app, sql, values)
-        
-        return redirect(url_for('index'))
-
-
-@app.route('/members', methods=['GET'])
-@role_required('committee')
-@flask_login.login_required
-def members():
+@app.get('/members', response_class=HTMLResponse)
+async def members(request: Request, user: User = role_required('committee')):
     data = []
-    for users in db_query(app, 'SELECT * FROM user_table'):
-        user = {
+    for users in db_query('SELECT * FROM user_table'):
+        user_data = {
             'email': users[0],
             'first_name': users[2],
             'last_name': users[3],
             'medical_info': users[4],
             'user_role': users[5]
         }
-        data.append(user)
-    return render_template('/committee/members.html',
-                           user=flask_login.current_user,
-                           data=data)
+        data.append(user_data)
+    return templates.TemplateResponse('/committee/members.html', {'request': request, 'user': user, 'data': data})
 
-@app.route('/update-password', methods=['GET'])
-@role_required('committee')
-@flask_login.login_required
-def update_password():
-    if request.method == 'GET':
-        # Prepare SQL query to update the password for an existing user
-        sql = """
-        UPDATE user_table
-        SET `password` = %s
-        WHERE `email` = %s
-        """
-        values = (
-            generate_password_hash(request.args.get('password')),  # Hash the new password
-            request.args.get('email'),  # Identify the user by email
-        )
+@app.get('/update-password')
+async def update_password(email: str, password: str, user: User = role_required('committee')):
+    sql = """
+    UPDATE user_table
+    SET `password` = %s
+    WHERE `email` = %s
+    """
+    values = (
+        generate_password_hash(password),
+        email,
+    )
+    db_update(sql, values)
+    return RedirectResponse(url='/members', status_code=status.HTTP_302_FOUND)
 
-        # Execute the database update function
-        db_update(app, sql, values)
-    return redirect(url_for('members'))
-
-@app.route('/update-role', methods=['GET'])
-@role_required('committee')
-@flask_login.login_required
-def update_role():
-    if request.method == 'GET':
-        # Prepare SQL query to update the password for an existing user
-        sql = """
-        UPDATE user_table
-        SET `user_role` = %s
-        WHERE `email` = %s
-        """
-        values = (
-            request.args.get('user_role'),
-            request.args.get('email'),  # Identify the user by email
-        )
-
-        # Execute the database update function
-        db_update(app, sql, values)
-    return redirect(url_for('members'))
-
+@app.get('/update-role')
+async def update_role(email: str, user_role: str, user: User = role_required('committee')):
+    sql = """
+    UPDATE user_table
+    SET `user_role` = %s
+    WHERE `email` = %s
+    """
+    values = (
+        user_role,
+        email,
+    )
+    db_update(sql, values)
+    return RedirectResponse(url='/members', status_code=status.HTTP_302_FOUND)
 
 if __name__ == "__main__":
-    app.run()
+    import uvicorn
+    uvicorn.run(app)
